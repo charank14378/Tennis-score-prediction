@@ -1,0 +1,139 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.model_selection import cross_val_score
+import pickle
+
+# Load datasets
+matches = pd.read_csv("/content/atp_matches_till_2022.csv")
+rankings = pd.read_csv("/content/atp_rankings_till_2022.csv")
+pp = pd.read_csv("/content/atp_players_till_2022.csv")
+
+# Ensure tourney_date is a datetime object and handle invalid dates
+matches['tourney_date'] = pd.to_datetime(matches['tourney_date'], format='%Y%m%d', errors='coerce')
+matches = matches.dropna(subset=['tourney_date'])
+
+# Handle incorrect 'ranking_date' entries
+rankings['ranking_date'] = pd.to_datetime(rankings['ranking_date'], format='%Y%m%d', errors='coerce')
+rankings = rankings.dropna(subset=['ranking_date'])
+
+# Create a match_id
+matches['match_id'] = matches['tourney_date'].astype(str) + "_" + matches['match_num'].astype(str)
+
+# Reduce memory usage by downcasting data types
+matches['winner_id'] = pd.to_numeric(matches['winner_id'], downcast='integer')
+matches['loser_id'] = pd.to_numeric(matches['loser_id'], downcast='integer')
+
+# Merge match data with ranking data based on player_id and date
+matches = matches.merge(rankings, left_on=['winner_id', 'tourney_date'], right_on=['player', 'ranking_date'], how='left', suffixes=('', '_winner'))
+matches = matches.merge(rankings, left_on=['loser_id', 'tourney_date'], right_on=['player', 'ranking_date'], how='left', suffixes=('', '_loser'))
+
+# Select a smaller sample of the data to reduce memory usage
+matches = matches.sample(frac=0.01, random_state=42)  # Use 1% of the data
+
+# Select relevant columns
+match_df = matches[['match_id', 'winner_name', 'loser_name', 'surface', 'tourney_name', 'score', 'best_of',
+                    'winner_rank', 'winner_rank_points', 'loser_rank', 'loser_rank_points', 'w_ace', 'w_df',
+                    'w_svpt', 'w_1stIn', 'w_1stWon', 'w_2ndWon', 'w_SvGms', 'w_bpSaved', 'w_bpFaced', 'l_ace',
+                    'l_df', 'l_svpt', 'l_1stIn', 'l_1stWon', 'l_2ndWon', 'l_SvGms', 'l_bpSaved', 'l_bpFaced']]
+
+# Replace any missing data with appropriate values
+match_df = match_df.fillna(0)
+
+# Convert numeric columns to appropriate types
+numeric_cols = ['winner_rank_points', 'loser_rank_points', 'w_ace', 'w_df', 'w_svpt', 'w_1stIn', 'w_1stWon',
+                'w_2ndWon', 'w_SvGms', 'w_bpSaved', 'w_bpFaced', 'l_ace', 'l_df', 'l_svpt', 'l_1stIn', 'l_1stWon',
+                'l_2ndWon', 'l_SvGms', 'l_bpSaved', 'l_bpFaced']
+match_df[numeric_cols] = match_df[numeric_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
+
+# Ensure columns 'surface' and 'winner_name' are strings
+match_df['surface'] = match_df['surface'].astype(str)
+match_df['winner_name'] = match_df['winner_name'].astype(str)
+
+# Create final dataframe for model training
+model_df = match_df[['match_id', 'surface', 'winner_name', 'loser_name', 'winner_rank', 'winner_rank_points',
+                     'loser_rank', 'loser_rank_points', 'w_ace', 'w_df', 'w_svpt', 'w_1stIn', 'w_1stWon',
+                     'w_2ndWon', 'w_SvGms', 'w_bpSaved', 'w_bpFaced', 'l_ace', 'l_df', 'l_svpt',
+                     'l_1stIn', 'l_1stWon', 'l_2ndWon', 'l_SvGms', 'l_bpSaved', 'l_bpFaced']]
+
+# Define features and target
+X = model_df[['surface', 'winner_name', 'loser_name', 'winner_rank', 'loser_rank', 'w_ace', 'w_df', 'w_svpt',
+              'w_1stIn', 'w_1stWon', 'w_2ndWon', 'w_SvGms', 'w_bpSaved', 'w_bpFaced', 'l_ace', 'l_df',
+              'l_svpt', 'l_1stIn', 'l_1stWon', 'l_2ndWon', 'l_SvGms', 'l_bpSaved', 'l_bpFaced']]
+y = model_df['winner_rank_points']
+
+# Filter out classes with very few samples
+min_samples_per_class = 2
+value_counts = y.value_counts()
+to_keep = value_counts[value_counts >= min_samples_per_class].index
+X = X[y.isin(to_keep)]
+y = y[y.isin(to_keep)]
+
+# Re-check to ensure all classes have at least min_samples_per_class
+while True:
+    value_counts = y.value_counts()
+    if (value_counts < min_samples_per_class).sum() == 0:
+        break
+    to_keep = value_counts[value_counts >= min_samples_per_class].index
+    X = X[y.isin(to_keep)]
+    y = y[y.isin(to_keep)]
+
+# Verify Data Balance before proceeding with the model
+#print("Unique classes in the target variable:", y.nunique())
+print("Value counts of the target variable:\n", y.value_counts())
+
+# If the target variable still has only one class, print an appropriate message and exit
+if y.nunique() < 2:
+    print("The target variable has fewer than 2 classes, which is not sufficient for classification.")
+else:
+    # Continue with data preprocessing and model training if there are sufficient classes
+    # Scaling numerical features
+    numeric_cols = ['winner_rank', 'loser_rank', 'w_ace', 'w_df', 'w_svpt', 'w_1stIn', 'w_1stWon', 'w_2ndWon',
+                    'w_SvGms', 'w_bpSaved', 'w_bpFaced', 'l_ace', 'l_df', 'l_svpt', 'l_1stIn', 'l_1stWon',
+                    'l_2ndWon', 'l_SvGms', 'l_bpSaved', 'l_bpFaced']
+    scaler = StandardScaler()
+    X[numeric_cols] = scaler.fit_transform(X[numeric_cols])
+
+    # Train-test split with stratification
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+    # Preprocessing with imputation for missing values
+    trf = ColumnTransformer([
+        ('cat', OneHotEncoder(sparse_output=False, drop='first', handle_unknown='ignore'), ['surface', 'winner_name', 'loser_name']),
+        ('num', SimpleImputer(strategy='mean'), numeric_cols)
+    ], remainder='passthrough')
+
+    # Logistic Regression model
+    pipe_lr = Pipeline([
+        ('prep', trf),
+        ('model', LogisticRegression(max_iter=100, tol=0.01))  # Reduced max_iter and increased tol for faster convergence
+    ])
+
+    # Fit on the full training data
+    pipe_lr.fit(X_train, y_train)
+    y_pred_lr = pipe_lr.predict(X_test)
+
+    # Calculate confusion matrix
+    lr_cm = confusion_matrix(y_test, y_pred_lr)
+
+    # Save the Logistic Regression model
+    pickle.dump(pipe_lr, open('pipe_lr.pkl', 'wb'))
+
+    # Print confusion matrix
+    print("Confusion Matrix:")
+    print(lr_cm)
+
+    # Cross-validation
+    cv_scores = cross_val_score(pipe_lr, X_train, y_train, cv=5, scoring='accuracy')
+    mean_cv_score = np.mean(cv_scores)
+    print("Mean Cross-Validation Accuracy:", mean_cv_score)
+
+    # Evaluate using different metrics
+    y_pred = pipe_lr.predict(X_test)
+    print(classification_report(y_test, y_pred))
